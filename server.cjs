@@ -1,0 +1,52 @@
+'use strict';
+const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto'),os=require('node:os');
+const E=require('./app/engine.js'),root=path.join(__dirname,'app'),dataDir=process.env.BYGGLAGET_DATA||path.join(__dirname,'data'),file=path.join(dataDir,'classrooms.json');
+const roleIds=['architect','calculator','buyer','builder','manager'],streams=new Map();let db={rooms:{}};
+fs.mkdirSync(dataDir,{recursive:true});if(fs.existsSync(file))db=JSON.parse(fs.readFileSync(file,'utf8'));
+const token=()=>crypto.randomBytes(24).toString('hex');
+function fail(status,message){const e=new Error(message);e.status=status;throw e;}
+function text(v,max=100){if(typeof v!=='string'||!v.trim()||v.length>max)fail(400,'Kontrollera alla textfält.');return v.trim();}
+function int(v,min,max){if(!Number.isInteger(v)||v<min||v>max)fail(400,'Ogiltigt antal eller inställning.');return v;}
+function persist(){const tmp=file+'.tmp';fs.writeFileSync(tmp,JSON.stringify(db),{mode:0o600});fs.renameSync(tmp,file);}
+function change(room,fn){const old=JSON.stringify(db);let result;try{result=fn();persist();}catch(e){db=JSON.parse(old);throw e;}for(const res of streams.get(room.code)||[])res.write('data: changed\n\n');return result;}
+const bearer=req=>(req.headers.authorization||'').replace(/^Bearer /,'');
+function teacher(req,r){if(bearer(req)!==r.teacherToken)fail(403,'Lärarbehörighet krävs.');}
+function teamAuth(req,r,id){const t=r.teams[id];if(!t)fail(404,'Laget finns inte.');if(bearer(req)!==t.token&&bearer(req)!==r.teacherToken)fail(403,'Fel lagnyckel.');return t;}
+function snapshot(t){return {id:t.id,revision:t.revision,state:t.state};}
+function board(r){const now=Date.now(),deliveries=[];for(const t of Object.values(r.teams)){const s=t.state;for(const o of s.orders)for(const [id,q]of Object.entries(o.lines)){const due=s.startedAt+(o.at+(id==='brown'?s.brownLead:E.byId[id].lead)*60)*1000;deliveries.push({key:t.id+'-'+o.id+'-'+id,team:s.team,order:o.id,material:id,quantity:q,dueAt:due,loaded:!!o.loaded?.[id],delivered:!!o.handed?.[id],cancelled:!!s.finishedAt&&due>s.finishedAt});}}return {name:r.name,code:r.code,serverNow:now,teamCount:Object.keys(r.teams).length,deliveries:deliveries.sort((a,b)=>a.dueAt-b.dueAt)};}
+function fullRoom(r){return {...board(r),studentUrls:Object.values(os.networkInterfaces()).flat().filter(i=>i.family==='IPv4'&&!i.internal).map(i=>'http://'+i.address+':'+server.address().port),settings:r.settings,teams:Object.values(r.teams).map(snapshot)};}
+async function body(req){let raw='';for await(const chunk of req){raw+=chunk;if(raw.length>100000)fail(413,'För stor begäran.');}try{return JSON.parse(raw||'{}');}catch{fail(400,'Ogiltiga formulärdata.');}}
+function initial(b,r){const names={};for(const id of roleIds)names[id]=text(b.names?.[id],40);if(new Set(Object.values(names).map(x=>x.toLowerCase())).size!==5)fail(400,'Fem olika elever eller unika alias behövs.');if(!['physical','digital'].includes(b.mode))fail(400,'Välj spelläge.');return {version:1,team:text(b.team,60),names,mode:b.mode,...r.settings,startedAt:null,finishedAt:null,orders:[],visits:0,photos:[],board:Array(48).fill(null),errors:{},extraCost:0,blocked:false,disturbance:'',log:[],notes:''};}
+function json(res,data,status=200){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(data));}
+const server=http.createServer(async(req,res)=>{try{res.setHeader('Referrer-Policy','no-referrer');res.setHeader('X-Content-Type-Options','nosniff');const url=new URL(req.url,'http://local'),p=url.pathname.split('/').filter(Boolean);
+if(req.headers.origin&&req.headers.origin!==`http://${req.headers.host}`&&req.headers.origin!==`https://${req.headers.host}`)fail(403,'Använd spelets egen adress.');
+if(p[0]==='api'){
+if(req.method==='POST'&&p[1]==='rooms'&&p.length===2){const b=await body(req);let code;do{code=crypto.randomBytes(3).toString('hex').toUpperCase();}while(db.rooms[code]);const r={code,name:text(b.name,60),teacherToken:token(),settings:{budget:int(b.budget??2600000,1,100000000),duration:int(b.duration??25,1,180),brownLead:int(b.brownLead??0,0,60)},teams:{}};change(r,()=>db.rooms[code]=r);return json(res,{code,teacherToken:r.teacherToken},201);}
+const r=db.rooms[p[2]?.toUpperCase()];if(!r)fail(404,'Klassrumskoden finns inte.');
+if(req.method==='GET'&&p[3]==='events'){res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-cache','Connection':'keep-alive'});res.write('data: connected\n\n');if(!streams.has(r.code))streams.set(r.code,new Set());streams.get(r.code).add(res);const timer=setInterval(()=>res.write(': heartbeat\n\n'),15000);req.on('close',()=>{clearInterval(timer);streams.get(r.code)?.delete(res);});return;}
+if(req.method==='GET'&&p[3]==='board')return json(res,board(r));
+if(req.method==='GET'&&p.length===3){teacher(req,r);return json(res,fullRoom(r));}
+if(req.method==='POST'&&p[3]==='teams'&&p.length===4){const b=await body(req),s=initial(b,r);if(Object.keys(r.teams).length>=50)fail(400,'Klassrummet är fullt.');if(Object.values(r.teams).some(t=>t.state.team.toLowerCase()===s.team.toLowerCase()))fail(409,'Lagnamnet används redan i detta klassrum.');const t={id:crypto.randomUUID(),token:token(),revision:0,state:s};change(r,()=>r.teams[t.id]=t);return json(res,{...snapshot(t),teamToken:t.token},201);}
+if(p[3]==='teams'&&p[4]){const t=teamAuth(req,r,p[4]),s=t.state,isTeacher=bearer(req)===r.teacherToken;
+if(req.method==='GET'&&p.length===5)return json(res,{...snapshot(t),serverNow:Date.now()});
+if(req.method==='POST'&&p[5]==='start'){if(s.startedAt)return json(res,snapshot(t));change(r,()=>{s.startedAt=Date.now();s.log.unshift({at:0,message:'Laget startade projektet.'});t.revision++;});return json(res,snapshot(t));}
+if(req.method==='POST'&&p[5]==='orders'){const b=await body(req);if(!s.startedAt||s.finishedAt||s.blocked)fail(409,'Laget kan inte beställa just nu.');text(b.requestId,80);const prior=s.orders.find(o=>o.requestId===b.requestId);if(prior)return json(res,snapshot(t));const q=E.quote(b.lines||{});if(!q.total)fail(400,'Välj minst en komponent.');change(r,()=>{const id=s.orders.length+1;s.orders.push({id,at:E.elapsed(s),lines:b.lines,requestId:b.requestId,handed:{}});s.log.unshift({at:E.elapsed(s),message:'Beställning '+id+' skickad till materialhandlaren.'});t.revision++;});return json(res,snapshot(t));}
+if(req.method==='POST'&&p[5]==='load'){teacher(req,r);const b=await body(req),o=s.orders.find(o=>o.id===b.orderId);if(!o||!o.lines[b.material])fail(404,'Leveransraden finns inte.');const due=o.at+(b.material==='brown'?s.brownLead:E.byId[b.material].lead)*60;if(E.elapsed(s)<due)fail(409,'Leveranstiden har inte löpt ut.');if(!o.loaded?.[b.material])change(r,()=>{o.loaded??={};o.loaded[b.material]=Date.now();t.revision++;});return json(res,snapshot(t));}
+if(req.method==='POST'&&p[5]==='handover'){teacher(req,r);const b=await body(req),o=s.orders.find(o=>o.id===b.orderId);if(!o||!o.lines[b.material])fail(404,'Leveransraden finns inte.');const due=o.at+(b.material==='brown'?s.brownLead:E.byId[b.material].lead)*60;if(E.elapsed(s)<due)fail(409,'Leveranstiden har inte löpt ut.');change(r,()=>{o.handed??={};o.handed[b.material]=true;o.loaded??={};o.loaded[b.material]??=Date.now();t.revision++;});return json(res,snapshot(t));}
+if(req.method==='PATCH'&&p.length===5){const b=await body(req);if(b.revision!==t.revision)fail(409,'Spelet uppdaterades. Försök igen.');if(s.finishedAt)fail(409,'Projektet är avslutat.');change(r,()=>{const x=b.patch||{};
+if(!s.startedAt){if(x.team!==undefined){const name=text(x.team,60);if(Object.values(r.teams).some(other=>other.id!==t.id&&other.state.team.toLowerCase()===name.toLowerCase()))fail(409,'Lagnamnet används redan.');s.team=name;}if(x.names){const tmp=initial({team:s.team,names:x.names,mode:s.mode},r);s.names=tmp.names;}}
+if(x.notes!==undefined){if(typeof x.notes!=='string'||x.notes.length>10000)fail(400,'För lång anteckning.');s.notes=x.notes;}
+if(x.board){if(s.mode!=='digital'||!s.startedAt||s.blocked||!Array.isArray(x.board)||x.board.length!==48||x.board.some(id=>id!==null&&!E.byId[id]))fail(400,'Ogiltigt bygge.');const candidate={...s,board:x.board};if(Object.values(E.inventory(candidate)).some(n=>n<0))fail(409,'Material saknas eller har inte levererats.');s.board=x.board;}
+if(x.visits!==undefined&&x.visits!==s.visits){if(!s.startedAt||s.blocked||x.visits!==s.visits+1)fail(409,'Besöket kan inte registreras.');s.visits=x.visits;}
+if(x.photos){if(!Array.isArray(x.photos)||x.photos.length>s.visits||x.photos.some(p=>!Array.isArray(p.board)||JSON.stringify(p.board)!==JSON.stringify(E.target)))fail(400,'Ogiltigt modellfoto.');s.photos=x.photos;}
+if(isTeacher){if(x.blocked!==undefined)s.blocked=!!x.blocked;if(x.disturbance!==undefined)s.disturbance=String(x.disturbance).slice(0,200);if(x.extraCost!==undefined)s.extraCost=int(x.extraCost,0,10000000);if(x.errors){for(const v of Object.values(x.errors)){int(v.missing||0,0,999);int(v.wrong||0,0,999);}s.errors=x.errors;}if(x.finishedAt){if(!s.startedAt||s.blocked)fail(409,'Laget måste ha startat och byggstopp vara åtgärdat.');s.finishedAt=Date.now();}}
+t.revision++;});return json(res,snapshot(t));}
+}fail(404,'Åtgärden finns inte.');}
+if(!['GET','HEAD'].includes(req.method))fail(405,'Metoden stöds inte.');const requested=url.pathname==='/'?'/classroom.html':url.pathname;const filename=path.resolve(root,'.'+decodeURIComponent(requested));if(!filename.startsWith(root+path.sep))fail(403,'Otillåten sökväg.');const ext=path.extname(filename);if(!['.html','.css','.js','.png','.svg'].includes(ext))fail(404,'Filen finns inte.');const content=await fs.promises.readFile(filename);res.writeHead(200,{'Content-Type':({'.html':'text/html','.js':'text/javascript','.css':'text/css','.png':'image/png','.svg':'image/svg+xml'}[ext])+'; charset=utf-8','Cache-Control':'no-cache'});res.end(content);
+}catch(e){json(res,{error:e.code==='ENOENT'?'Sidan finns inte.':e.message},e.status||(e.code==='ENOENT'?404:400));}});
+function start(){const port=Number(process.env.PORT||4173);server.listen(port,'0.0.0.0',()=>{console.log('Bygglaget: http://127.0.0.1:'+port);for(const list of Object.values(os.networkInterfaces()))for(const i of list)if(i.family==='IPv4'&&!i.internal)console.log('Elevadress: http://'+i.address+':'+port);});}
+if(require.main===module)start();
+module.exports={server,start};
+
+
+

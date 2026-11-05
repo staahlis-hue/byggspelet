@@ -1,0 +1,16 @@
+(function(){
+'use strict';
+window.GameNotices=function(scope){
+const key='bygglaget-notices-'+scope;let saved={initialized:false,items:[]};try{saved=JSON.parse(localStorage.getItem(key))||saved;}catch{}
+const seen=new Set(saved.items.map(n=>n.id));let enabled=false;
+const bar=document.createElement('div');bar.className='notice-tools';bar.innerHTML='<button type="button" class="secondary notice-bell">Notiser <span class="notice-count">0</span></button><button type="button" class="secondary notice-permission">Aktivera skrivbordsnotiser</button>';document.body.append(bar);
+const panel=document.createElement('section');panel.className='notice-history';panel.hidden=true;panel.setAttribute('aria-label','Notishistorik');document.body.append(panel);
+const stack=document.createElement('div');stack.className='notice-stack';stack.setAttribute('aria-live','polite');stack.setAttribute('aria-atomic','false');document.body.append(stack);
+function persist(){try{localStorage.setItem(key,JSON.stringify(saved));}catch{}}
+function draw(){bar.querySelector('.notice-count').textContent=saved.items.filter(x=>!x.read).length;panel.replaceChildren();const title=document.createElement('h2');title.textContent='Notiser';panel.append(title);if(!saved.items.length){const p=document.createElement('p');p.textContent='Här visas nya beställningar och leveransbesked.';panel.append(p);}for(const n of [...saved.items].reverse().slice(0,100)){const p=document.createElement('p');p.className='notice-entry';const strong=document.createElement('strong');strong.textContent=n.title;const text=document.createElement('span');text.textContent=n.text;const time=document.createElement('small');time.textContent=new Date(n.at).toLocaleTimeString('sv-SE');p.append(strong,text,time);panel.append(p);}}
+bar.querySelector('.notice-bell').onclick=()=>{panel.hidden=!panel.hidden;if(!panel.hidden){saved.items.forEach(x=>x.read=true);persist();draw();}};
+const permission=bar.querySelector('.notice-permission');if(!('Notification'in window)||!window.isSecureContext){permission.textContent='Notiser i spelet är aktiva';permission.disabled=true;}else{enabled=Notification.permission==='granted';if(enabled)permission.textContent='Skrivbordsnotiser aktiva';permission.onclick=async()=>{const result=await Notification.requestPermission();enabled=result==='granted';permission.textContent=enabled?'Skrivbordsnotiser aktiva':'Notiser visas i spelet';};}
+function pop(n){const item=document.createElement('div');item.className='notice-pop';const heading=document.createElement('strong');heading.textContent=n.title;const p=document.createElement('p');p.textContent=n.text;const close=document.createElement('button');close.textContent='×';close.setAttribute('aria-label','Stäng notis');close.onclick=()=>item.remove();item.append(heading,p,close);stack.append(item);setTimeout(()=>item.remove(),12000);if(enabled&&document.visibilityState==='hidden'){try{new Notification(n.title,{body:n.text,tag:n.id});}catch{}}}
+this.ingest=function(items){const initial=!saved.initialized;for(const n of items){if(seen.has(n.id))continue;seen.add(n.id);const entry={...n,read:initial};saved.items.push(entry);if(!initial)pop(entry);}saved.initialized=true;persist();draw();};draw();
+};
+})();
